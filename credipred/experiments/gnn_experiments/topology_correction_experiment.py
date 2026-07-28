@@ -35,8 +35,11 @@ from credipred.utils.logger import Logger
 # Loss
 # ---------------------------------------------------------------------------
 
+
 def _quantile_loss(
-    preds: torch.Tensor, targets: torch.Tensor, alpha: float,
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
 ) -> torch.Tensor:
     """Pinball loss for [mid, lower, upper]."""
     mid, lower, upper = preds[:, 0], preds[:, 1], preds[:, 2]
@@ -64,6 +67,7 @@ def _quantile_loss(
 # ---------------------------------------------------------------------------
 # Extract base predictions
 # ---------------------------------------------------------------------------
+
 
 def _extract_base_predictions(
     data,
@@ -113,12 +117,17 @@ def _extract_base_predictions(
 
     logging.info(
         'Base prediction stats — mid: mean=%.4f, lower: mean=%.4f, upper: mean=%.4f',
-        all_preds[:, 0].mean(), all_preds[:, 1].mean(), all_preds[:, 2].mean(),
+        all_preds[:, 0].mean(),
+        all_preds[:, 1].mean(),
+        all_preds[:, 2].mean(),
     )
     widths = all_preds[:, 2] - all_preds[:, 1]
     logging.info(
         'Raw interval width: mean=%.4f std=%.4f min=%.4f max=%.4f',
-        widths.mean(), widths.std(), widths.min(), widths.max(),
+        widths.mean(),
+        widths.std(),
+        widths.min(),
+        widths.max(),
     )
 
     del base_model
@@ -129,6 +138,7 @@ def _extract_base_predictions(
 # ---------------------------------------------------------------------------
 # Train / evaluate correction
 # ---------------------------------------------------------------------------
+
 
 def _size_loss_regression(
     corrected: torch.Tensor,
@@ -259,12 +269,17 @@ def _evaluate_correction(
         total_random_loss += random_loss.item()
         n_batches += 1
 
-    return total_loss / n_batches, total_mean_loss / n_batches, total_random_loss / n_batches
+    return (
+        total_loss / n_batches,
+        total_mean_loss / n_batches,
+        total_random_loss / n_batches,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def run_topology_correction(
     data_arguments: DataArguments,
@@ -287,7 +302,10 @@ def run_topology_correction(
         base_preds = torch.load(cache_path, map_location='cpu', weights_only=True)
     else:
         base_preds = _extract_base_predictions(
-            data, model_arguments, weight_directory, device,
+            data,
+            model_arguments,
+            weight_directory,
+            device,
         )
         torch.save(base_preds, cache_path)
         logging.info('Saved base predictions cache to %s', cache_path)
@@ -334,8 +352,14 @@ def run_topology_correction(
     total_epochs = model_arguments.epochs
 
     logging.info('=== Training Topology Correction GNN ===')
-    logging.info('Two-phase training: pred-only epochs=%d, total epochs=%d', pred_only_epochs, total_epochs)
-    logging.info('size_loss_weight=%.3f, reg_loss_weight=%.3f', size_loss_weight, reg_loss_weight)
+    logging.info(
+        'Two-phase training: pred-only epochs=%d, total epochs=%d',
+        pred_only_epochs,
+        total_epochs,
+    )
+    logging.info(
+        'size_loss_weight=%.3f, reg_loss_weight=%.3f', size_loss_weight, reg_loss_weight
+    )
 
     logger = Logger(model_arguments.runs)
     loss_tuple_run: List[List[Tuple[float, float, float, float, float]]] = []
@@ -363,7 +387,10 @@ def run_topology_correction(
 
         for epoch in tqdm(range(1, 1 + total_epochs), desc='Epochs'):
             _, batch_preds, batch_targets = _train_correction_epoch(
-                correction_model, train_loader, optimizer, alpha,
+                correction_model,
+                train_loader,
+                optimizer,
+                alpha,
                 epoch=epoch,
                 pred_only_epochs=pred_only_epochs,
                 size_loss_weight=size_loss_weight,
@@ -373,16 +400,31 @@ def run_topology_correction(
             epoch_avg_targets.append(batch_targets)
 
             train_loss, _, _ = _evaluate_correction(
-                correction_model, train_loader, 'train_mask', alpha,
+                correction_model,
+                train_loader,
+                'train_mask',
+                alpha,
             )
             valid_loss, valid_mean_loss, valid_random_loss = _evaluate_correction(
-                correction_model, val_loader, 'valid_mask', alpha,
+                correction_model,
+                val_loader,
+                'valid_mask',
+                alpha,
             )
             test_loss, test_mean_loss, test_random_loss = _evaluate_correction(
-                correction_model, test_loader, 'test_mask', alpha,
+                correction_model,
+                test_loader,
+                'test_mask',
+                alpha,
             )
 
-            result = (train_loss, valid_loss, test_loss, test_mean_loss, test_random_loss)
+            result = (
+                train_loss,
+                valid_loss,
+                test_loss,
+                test_mean_loss,
+                test_random_loss,
+            )
             loss_tuple_epoch.append(result)
             logger.add_result(
                 run,
@@ -394,6 +436,7 @@ def run_topology_correction(
                 best_state_dict = snapshot_state_dict(correction_model)
 
         from credipred.utils.plot import mean_across_lists
+
         final_avg_preds.append(mean_across_lists(epoch_avg_preds))
         final_avg_targets.append(mean_across_lists(epoch_avg_targets))
         loss_tuple_run.append(loss_tuple_epoch)
@@ -411,22 +454,29 @@ def run_topology_correction(
     logging.info(logger.get_avg_statistics())
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=10,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=10,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=5,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=5,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=1,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=1,
         )
     )
 
     logging.info('Saving pkl of results')
     from credipred.utils.save import save_loss_results
+
     save_loss_results(loss_tuple_run, model_arguments.model, 'topology_correction')
 
     # ---- Post-hoc CQR: Base vs Corrected ----
@@ -480,19 +530,24 @@ def run_topology_correction(
 
     # CQR comparison
     from credipred.conformal_regression.cqr import evaluate_intervals
+
     base_metrics = evaluate_intervals(base_preds, labels, val_idx, test_idx, alpha)
     corr_metrics = evaluate_intervals(corrected_preds, labels, val_idx, test_idx, alpha)
 
     logging.info('=== CQR Comparison ===')
     logging.info(
         '  Base CQR:      coverage=%.4f width=%.4f mae=%.4f qhat=%.4f',
-        base_metrics.coverage, base_metrics.avg_width,
-        base_metrics.mae, base_metrics.qhat,
+        base_metrics.coverage,
+        base_metrics.avg_width,
+        base_metrics.mae,
+        base_metrics.qhat,
     )
     logging.info(
         '  Corrected CQR: coverage=%.4f width=%.4f mae=%.4f qhat=%.4f',
-        corr_metrics.coverage, corr_metrics.avg_width,
-        corr_metrics.mae, corr_metrics.qhat,
+        corr_metrics.coverage,
+        corr_metrics.avg_width,
+        corr_metrics.mae,
+        corr_metrics.qhat,
     )
 
     # Per-quintile coverage
@@ -514,5 +569,8 @@ def run_topology_correction(
             q_idx = order[s:e]
             logging.info(
                 '    Q%d: cov=%.4f width=%.4f n=%d',
-                q + 1, covered[q_idx].mean(), w[q_idx].mean(), len(q_idx),
+                q + 1,
+                covered[q_idx].mean(),
+                w[q_idx].mean(),
+                len(q_idx),
             )

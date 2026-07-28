@@ -25,7 +25,9 @@ from credipred.utils.logger import Logger
 
 
 def _quantile_loss(
-    preds: torch.Tensor, targets: torch.Tensor, alpha: float,
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float,
 ) -> torch.Tensor:
     """Pinball loss for quantile regression (mid, lower, upper)."""
     mid, lower, upper = preds[:, 0], preds[:, 1], preds[:, 2]
@@ -33,7 +35,9 @@ def _quantile_loss(
 
     residual_lower = targets - lower
     loss_lower = torch.mean(
-        torch.where(residual_lower >= 0, alpha * residual_lower, (alpha - 1) * residual_lower)
+        torch.where(
+            residual_lower >= 0, alpha * residual_lower, (alpha - 1) * residual_lower
+        )
     )
     residual_upper = targets - upper
     loss_upper = torch.mean(
@@ -116,11 +120,20 @@ def _evaluate(
         total_random_loss += random_loss.item()
         n_batches += 1
 
-    return total_loss / n_batches, total_mean_loss / n_batches, total_random_loss / n_batches
+    return (
+        total_loss / n_batches,
+        total_mean_loss / n_batches,
+        total_random_loss / n_batches,
+    )
 
 
 def _extract_base_widths_and_confidence(
-    data, model_arguments, weight_directory, split_idx, device, alpha,
+    data,
+    model_arguments,
+    weight_directory,
+    split_idx,
+    device,
+    alpha,
 ):
     """Stage 1: Load base model, extract CQR-adjusted widths, compute confidence."""
     logging.info('=== Stage 1: Extracting widths from base quantile model ===')
@@ -172,7 +185,9 @@ def _extract_base_widths_and_confidence(
     val_idx = split_idx['valid']
     labels = data.y.cpu()
     cal_scores = compute_cqr_scores(
-        all_preds[val_idx, 1], all_preds[val_idx, 2], labels[val_idx],
+        all_preds[val_idx, 1],
+        all_preds[val_idx, 2],
+        labels[val_idx],
     )
     qhat = compute_qhat(cal_scores, alpha)
     logging.info('CQR qhat from val set: %.4f', qhat)
@@ -184,21 +199,32 @@ def _extract_base_widths_and_confidence(
     widths_norm = (widths - widths.min()) / (widths.max() - widths.min() + 1e-8)
     eps = 0.01
     confidence = 1.0 / (widths_norm + eps)
-    confidence = (confidence - confidence.min()) / (confidence.max() - confidence.min() + 1e-8)
+    confidence = (confidence - confidence.min()) / (
+        confidence.max() - confidence.min() + 1e-8
+    )
 
     data.confidence = confidence
 
     logging.info(
         'Raw width stats: mean=%.4f std=%.4f min=%.4f max=%.4f',
-        raw_widths.mean(), raw_widths.std(), raw_widths.min(), raw_widths.max(),
+        raw_widths.mean(),
+        raw_widths.std(),
+        raw_widths.min(),
+        raw_widths.max(),
     )
     logging.info(
         'CQR-adjusted width stats: mean=%.4f std=%.4f min=%.4f max=%.4f',
-        widths.mean(), widths.std(), widths.min(), widths.max(),
+        widths.mean(),
+        widths.std(),
+        widths.min(),
+        widths.max(),
     )
     logging.info(
         'Confidence stats: mean=%.4f std=%.4f min=%.4f max=%.4f',
-        confidence.mean(), confidence.std(), confidence.min(), confidence.max(),
+        confidence.mean(),
+        confidence.std(),
+        confidence.min(),
+        confidence.max(),
     )
 
     del base_model
@@ -224,7 +250,12 @@ def run_uncertainty_gat(
 
     # ---- Stage 1: Extract widths and confidence ----
     all_preds, labels, qhat = _extract_base_widths_and_confidence(
-        data, model_arguments, weight_directory, split_idx, device, alpha,
+        data,
+        model_arguments,
+        weight_directory,
+        split_idx,
+        device,
+        alpha,
     )
 
     # ---- Stage 2: Train UncertaintyGAT (same structure as gnn_experiment) ----
@@ -290,19 +321,33 @@ def run_uncertainty_gat(
         epoch_avg_targets: List[List[float]] = []
 
         for epoch in tqdm(range(1, 1 + model_arguments.epochs), desc='Epochs'):
-            _, batch_preds, batch_targets = _train_epoch(model, train_loader, optimizer, alpha)
+            _, batch_preds, batch_targets = _train_epoch(
+                model, train_loader, optimizer, alpha
+            )
             epoch_avg_preds.append(batch_preds)
             epoch_avg_targets.append(batch_targets)
 
             train_loss, _, _ = _evaluate(model, train_loader, 'train_mask', alpha)
             valid_loss, valid_mean_loss, valid_random_loss = _evaluate(
-                model, val_loader, 'valid_mask', alpha,
+                model,
+                val_loader,
+                'valid_mask',
+                alpha,
             )
             test_loss, test_mean_loss, test_random_loss = _evaluate(
-                model, test_loader, 'test_mask', alpha,
+                model,
+                test_loader,
+                'test_mask',
+                alpha,
             )
 
-            result = (train_loss, valid_loss, test_loss, test_mean_loss, test_random_loss)
+            result = (
+                train_loss,
+                valid_loss,
+                test_loss,
+                test_mean_loss,
+                test_random_loss,
+            )
             loss_tuple_epoch.append(result)
             logger.add_result(
                 run,
@@ -314,6 +359,7 @@ def run_uncertainty_gat(
                 best_state_dict = snapshot_state_dict(model)
 
         from credipred.utils.plot import mean_across_lists
+
         final_avg_preds.append(mean_across_lists(epoch_avg_preds))
         final_avg_targets.append(mean_across_lists(epoch_avg_targets))
         loss_tuple_run.append(loss_tuple_epoch)
@@ -331,22 +377,29 @@ def run_uncertainty_gat(
     logging.info(logger.get_avg_statistics())
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=10,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=10,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=5,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=5,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=1,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=1,
         )
     )
 
     logging.info('Saving pkl of results')
     from credipred.utils.save import save_loss_results
+
     save_loss_results(loss_tuple_run, model_arguments.model, 'uncertainty_gat')
 
     # ---- Post-hoc CQR evaluation: Base vs UQ-GAT ----
@@ -396,19 +449,24 @@ def run_uncertainty_gat(
     logging.info('  UQ-GAT:    MAE=%.4f avg_width=%.4f', mae_test, widths_test.mean())
 
     from credipred.conformal_regression.cqr import evaluate_intervals
+
     base_metrics = evaluate_intervals(all_preds, labels, val_idx, test_idx, alpha)
     uq_metrics = evaluate_intervals(uq_preds, labels, val_idx, test_idx, alpha)
 
     logging.info('=== CQR Comparison ===')
     logging.info(
         '  Base CQR:  coverage=%.4f width=%.4f mae=%.4f qhat=%.4f',
-        base_metrics.coverage, base_metrics.avg_width,
-        base_metrics.mae, base_metrics.qhat,
+        base_metrics.coverage,
+        base_metrics.avg_width,
+        base_metrics.mae,
+        base_metrics.qhat,
     )
     logging.info(
         '  UQ-GAT CQR: coverage=%.4f width=%.4f mae=%.4f qhat=%.4f',
-        uq_metrics.coverage, uq_metrics.avg_width,
-        uq_metrics.mae, uq_metrics.qhat,
+        uq_metrics.coverage,
+        uq_metrics.avg_width,
+        uq_metrics.mae,
+        uq_metrics.qhat,
     )
 
     # Per-quintile comparison
@@ -430,5 +488,8 @@ def run_uncertainty_gat(
             q_idx = order[s:e]
             logging.info(
                 '    Q%d: cov=%.4f width=%.4f n=%d',
-                q + 1, covered[q_idx].mean(), w[q_idx].mean(), len(q_idx),
+                q + 1,
+                covered[q_idx].mean(),
+                w[q_idx].mean(),
+                len(q_idx),
             )

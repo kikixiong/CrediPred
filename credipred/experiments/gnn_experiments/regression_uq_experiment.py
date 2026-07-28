@@ -30,7 +30,9 @@ from credipred.utils.save import save_loss_results
 
 
 def _quantile_loss(
-    preds: Tensor, targets: Tensor, alpha: float,
+    preds: Tensor,
+    targets: Tensor,
+    alpha: float,
 ) -> Tensor:
     """Pinball loss for quantile regression (mid, lower, upper)."""
     mid, lower, upper = preds[:, 0], preds[:, 1], preds[:, 2]
@@ -38,7 +40,9 @@ def _quantile_loss(
 
     residual_lower = targets - lower
     loss_lower = torch.mean(
-        torch.where(residual_lower >= 0, alpha * residual_lower, (alpha - 1) * residual_lower)
+        torch.where(
+            residual_lower >= 0, alpha * residual_lower, (alpha - 1) * residual_lower
+        )
     )
     residual_upper = targets - upper
     loss_upper = torch.mean(
@@ -273,16 +277,18 @@ def run_regression_uq(
                 ),
             )
 
-            wandb.log({
-                'run': run,
-                'epoch': epoch,
-                'train_loss': train_loss,
-                'valid_loss': valid_loss,
-                'test_loss': test_loss,
-                'train_quantile_loss': train_quantile_loss,
-                'valid_quantile_loss': valid_quantile_loss,
-                'test_quantile_loss': test_quantile_loss,
-            })
+            wandb.log(
+                {
+                    'run': run,
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'valid_loss': valid_loss,
+                    'test_loss': test_loss,
+                    'train_quantile_loss': train_quantile_loss,
+                    'valid_quantile_loss': valid_quantile_loss,
+                    'test_quantile_loss': test_quantile_loss,
+                }
+            )
 
             if valid_quantile_loss < global_best_val_quantile_loss:
                 global_best_val_quantile_loss = valid_quantile_loss
@@ -303,17 +309,23 @@ def run_regression_uq(
     logging.info(logger.get_avg_statistics())
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=10,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=10,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=5,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=5,
         )
     )
     logging.info(
         logger.per_run_within_error(
-            preds=final_avg_preds, targets=final_avg_targets, percent=1,
+            preds=final_avg_preds,
+            targets=final_avg_targets,
+            percent=1,
         )
     )
 
