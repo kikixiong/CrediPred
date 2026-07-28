@@ -1,0 +1,44 @@
+MetaArguments:
+  log_file_path: "logs/regression_uq/gat_quantile_domainrel_dec_corrected_loss.log"
+  node_file: "../data/CrediBench/dec2024/vertices.csv"
+  edge_file: "../data/CrediBench/dec2024/edges.csv"
+  target_file: "../data/CrediBench/dec2024/targets.csv"
+  processed_location: "../data/CrediBench/dec2024/processed_dir/pc1"
+  weights_directory: "../data/dec_2024/weights_quantile_corrected_loss_20260728"
+  database_folder: "../data/CrediBench/dec2024"
+  split_folder: "../data/CrediBench/dec2024"
+  embedding_location: "../data/CrediBench/content_embedding/dec2024/embeddinggema-300m"
+  embedding_lookup: "dec2024_wetcontent_domains_index.pkl"
+  target_col: "pc1"
+  target_index_name: "nid"
+  target_index_col: 0
+  edge_src_col: "src"
+  edge_dst_col: "dst"
+  index_col: 0
+  encoder_dict:
+    pre: PRE
+  is_scratch_location: true
+  global_seed: 42
+
+ExperimentArguments:
+  exp_args:
+    GAT:
+      model_args:
+        model: "GAT"
+        num_layers: 3
+        hidden_channels: 256
+        normalization: "BatchNorm"
+        num_neighbors: [30, 30, 30]
+        batch_size: 1024
+        embedding_dimension: 128
+        dropout: 0.1
+        lr: 0.001
+        weight_decay: 0.0000236
+        epochs: 100
+        runs: 3
+        device: 0
+        log_steps: 10
+        quantile_alpha: 0.05
+      data_args:
+        task_name: "node-regression-quantile-corrected-loss"
+        is_regression: true

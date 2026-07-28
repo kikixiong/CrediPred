@@ -20,6 +20,7 @@ from credipred.dataset.temporal_dataset import TemporalDatasetGlobalSplit
 from credipred.gnn.model import Model
 from credipred.gnn.uncertainty_gat import UncertaintyGATModel
 from credipred.utils.args import DataArguments, ModelArguments
+from credipred.utils.checkpoint import snapshot_state_dict
 from credipred.utils.logger import Logger
 
 
@@ -36,7 +37,11 @@ def _quantile_loss(
     )
     residual_upper = targets - upper
     loss_upper = torch.mean(
-        torch.where(residual_upper >= 0, (1 - alpha) * residual_upper, -(1 - alpha) * residual_upper)
+        torch.where(
+            residual_upper >= 0,
+            (1 - alpha) * residual_upper,
+            -alpha * residual_upper,
+        )
     )
     return loss_mid + loss_lower + loss_upper
 
@@ -306,7 +311,7 @@ def run_uncertainty_gat(
 
             if valid_loss < global_best_val_loss:
                 global_best_val_loss = valid_loss
-                best_state_dict = model.state_dict()
+                best_state_dict = snapshot_state_dict(model)
 
         from credipred.utils.plot import mean_across_lists
         final_avg_preds.append(mean_across_lists(epoch_avg_preds))

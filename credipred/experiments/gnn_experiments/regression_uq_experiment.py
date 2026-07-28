@@ -18,6 +18,7 @@ from tqdm import tqdm
 from credipred.dataset.temporal_dataset import TemporalDatasetGlobalSplit
 from credipred.gnn.model import Model
 from credipred.utils.args import DataArguments, ModelArguments
+from credipred.utils.checkpoint import snapshot_state_dict
 from credipred.utils.logger import Logger
 from credipred.utils.plot import (
     Scoring,
@@ -41,7 +42,11 @@ def _quantile_loss(
     )
     residual_upper = targets - upper
     loss_upper = torch.mean(
-        torch.where(residual_upper >= 0, (1 - alpha) * residual_upper, -(1 - alpha) * residual_upper)
+        torch.where(
+            residual_upper >= 0,
+            (1 - alpha) * residual_upper,
+            -alpha * residual_upper,
+        )
     )
     return loss_mid + loss_lower + loss_upper
 
@@ -86,13 +91,14 @@ def evaluate(
     loader: NeighborLoader,
     mask_name: str,
     alpha: float,
-) -> Tuple[float, float, float]:
-    """Evaluate with MAE on mid prediction. Returns (mae_loss, mean_baseline_loss, random_baseline_loss)."""
+) -> Tuple[float, float, float, float]:
+    """Return midpoint MAE, two MAE baselines, and the quantile objective."""
     model.eval()
     device = next(model.parameters()).device
     total_loss = 0
     total_mean_loss = 0
     total_random_loss = 0
+    total_quantile_loss = 0
     n_batches = 0
     for batch in loader:
         batch = batch.to(device)
@@ -108,6 +114,11 @@ def evaluate(
         # Use MAE on mid prediction for fair comparison with MAE baseline
         mid_preds = seed_preds[mask, 0]
         loss = F.l1_loss(mid_preds, seed_targets[mask])
+        quantile_loss = _quantile_loss(
+            seed_preds[mask],
+            seed_targets[mask],
+            alpha,
+        )
         mean_preds = torch.full(seed_targets[mask].size(), 0.5).to(device)
         random_preds = torch.rand(seed_targets[mask].size(0)).to(device)
         mean_loss = F.l1_loss(mean_preds, seed_targets[mask])
@@ -116,12 +127,14 @@ def evaluate(
         total_loss += loss.item()
         total_mean_loss += mean_loss.item()
         total_random_loss += random_loss.item()
+        total_quantile_loss += quantile_loss.item()
         n_batches += 1
 
     avg_loss = total_loss / n_batches
     avg_mean = total_mean_loss / n_batches
     avg_random = total_random_loss / n_batches
-    return avg_loss, avg_mean, avg_random
+    avg_quantile = total_quantile_loss / n_batches
+    return avg_loss, avg_mean, avg_random, avg_quantile
 
 
 def run_regression_uq(
@@ -191,7 +204,7 @@ def run_regression_uq(
     loss_tuple_run: List[List[Tuple[float, float, float, float, float]]] = []
     final_avg_preds: List[List[float]] = []
     final_avg_targets: List[List[float]] = []
-    global_best_val_loss = float('inf')
+    global_best_val_quantile_loss = float('inf')
     best_state_dict = None
 
     logging.info('*** Training ***')
@@ -222,15 +235,24 @@ def run_regression_uq(
             epoch_avg_preds.append(batch_preds)
             epoch_avg_targets.append(batch_targets)
 
-            train_loss, _, _ = evaluate(model, train_loader, 'train_mask', alpha)
+            train_loss, _, _, train_quantile_loss = evaluate(
+                model,
+                train_loader,
+                'train_mask',
+                alpha,
+            )
             (
                 valid_loss,
                 valid_mean_baseline_loss,
                 valid_random_baseline_loss,
+                valid_quantile_loss,
             ) = evaluate(model, val_loader, 'valid_mask', alpha)
-            test_loss, test_mean_baseline_loss, test_random_baseline_loss = (
-                evaluate(model, test_loader, 'test_mask', alpha)
-            )
+            (
+                test_loss,
+                test_mean_baseline_loss,
+                test_random_baseline_loss,
+                test_quantile_loss,
+            ) = evaluate(model, test_loader, 'test_mask', alpha)
 
             result = (
                 train_loss,
@@ -257,11 +279,14 @@ def run_regression_uq(
                 'train_loss': train_loss,
                 'valid_loss': valid_loss,
                 'test_loss': test_loss,
+                'train_quantile_loss': train_quantile_loss,
+                'valid_quantile_loss': valid_quantile_loss,
+                'test_quantile_loss': test_quantile_loss,
             })
 
-            if valid_loss < global_best_val_loss:
-                global_best_val_loss = valid_loss
-                best_state_dict = model.state_dict()
+            if valid_quantile_loss < global_best_val_quantile_loss:
+                global_best_val_quantile_loss = valid_quantile_loss
+                best_state_dict = snapshot_state_dict(model)
 
         final_avg_preds.append(mean_across_lists(epoch_avg_preds))
         final_avg_targets.append(mean_across_lists(epoch_avg_targets))

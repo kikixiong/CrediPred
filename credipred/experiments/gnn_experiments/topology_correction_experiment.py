@@ -27,6 +27,7 @@ from credipred.conformal_regression.correction_gnn import CorrectionGNN
 from credipred.dataset.temporal_dataset import TemporalDatasetGlobalSplit
 from credipred.gnn.model import Model
 from credipred.utils.args import DataArguments, ModelArguments
+from credipred.utils.checkpoint import snapshot_state_dict
 from credipred.utils.logger import Logger
 
 
@@ -54,7 +55,7 @@ def _quantile_loss(
         torch.where(
             residual_upper >= 0,
             (1 - alpha) * residual_upper,
-            -(1 - alpha) * residual_upper,
+            -alpha * residual_upper,
         )
     )
     return loss_mid + loss_lower + loss_upper
@@ -390,7 +391,7 @@ def run_topology_correction(
 
             if valid_loss < global_best_val_loss:
                 global_best_val_loss = valid_loss
-                best_state_dict = correction_model.state_dict()
+                best_state_dict = snapshot_state_dict(correction_model)
 
         from credipred.utils.plot import mean_across_lists
         final_avg_preds.append(mean_across_lists(epoch_avg_preds))
@@ -456,6 +457,10 @@ def run_topology_correction(
             original_ids = batch.n_id[:n_seed]
             base_seed = batch.base_preds[:n_seed].to(device)
             corrected_preds[original_ids] = (base_seed + delta[:n_seed]).cpu()
+
+    corrected_preds_path = save_dir / 'corrected_preds.pt'
+    torch.save(corrected_preds, corrected_preds_path)
+    logging.info('Saved corrected predictions to %s', corrected_preds_path)
 
     labels = data.y.cpu()
 
