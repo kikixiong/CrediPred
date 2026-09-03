@@ -36,7 +36,9 @@ artifacts and 66 unaggregated metric rows.
 ## Execution gates
 
 1. Build one locked, isolated Python environment including the `rq1` dependency
-   group and verify XGBoost reports version `3.2.0`.
+   group. Pin the official PyG `torch-sparse 0.6.18` and `torch-scatter 2.1.2`
+   wheels matching Torch 2.7, CUDA 12.6, and Python 3.11, and verify XGBoost
+   reports version `3.2.0`.
 2. Execute the synthetic strong-baseline smoke from an immutable source snapshot.
 3. Submit seed-42 GAT alone and observe real startup without OOM before releasing
    the remaining pretest DAG.

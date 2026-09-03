@@ -508,6 +508,8 @@ dev = [
     { name = "types-pyyaml" },
 ]
 rq1 = [
+    { name = "torch-scatter" },
+    { name = "torch-sparse" },
     { name = "xgboost-cpu" },
 ]
 
@@ -556,7 +558,11 @@ dev = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20240917" },
 ]
-rq1 = [{ name = "xgboost-cpu", specifier = "==3.2.0" }]
+rq1 = [
+    { name = "torch-scatter", url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_scatter-2.1.2%2Bpt27cu126-cp311-cp311-linux_x86_64.whl" },
+    { name = "torch-sparse", url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_sparse-0.6.18%2Bpt27cu126-cp311-cp311-linux_x86_64.whl" },
+    { name = "xgboost-cpu", specifier = "==3.2.0" },
+]
 
 [[package]]
 name = "cycler"
@@ -3078,6 +3084,40 @@ sdist = { url = "https://files.pythonhosted.org/packages/e8/81/e1b015494cb9e0bf4
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/9f/157e913626c1acfb3b19ce000b1a6e4e4fb177c0bc0ea0c67ca5bd714b5a/torch_geometric-2.6.1-py3-none-any.whl", hash = "sha256:8faeb353f9655f7dbec44c5e0b44c721773bdfb279994da96b9b8b12fd30f427", size = 1135632, upload-time = "2024-09-26T08:11:27.194Z" },
 ]
+
+[[package]]
+name = "torch-scatter"
+version = "2.1.2+pt27cu126"
+source = { url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_scatter-2.1.2%2Bpt27cu126-cp311-cp311-linux_x86_64.whl" }
+wheels = [
+    { url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_scatter-2.1.2%2Bpt27cu126-cp311-cp311-linux_x86_64.whl", hash = "sha256:4769e4f69b35701b96b56716a62364264d0608a1224d4e3aeccf9e34e8679577" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-cov", marker = "extra == 'test'" },
+]
+provides-extras = ["test"]
+
+[[package]]
+name = "torch-sparse"
+version = "0.6.18+pt27cu126"
+source = { url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_sparse-0.6.18%2Bpt27cu126-cp311-cp311-linux_x86_64.whl" }
+dependencies = [
+    { name = "scipy" },
+]
+wheels = [
+    { url = "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_sparse-0.6.18%2Bpt27cu126-cp311-cp311-linux_x86_64.whl", hash = "sha256:e3e5f83c243928db4850d17aeefba0460a3cfb746040cc997e3688d69afd684c" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-cov", marker = "extra == 'test'" },
+    { name = "scipy" },
+]
+provides-extras = ["test"]
 
 [[package]]
 name = "torcheval"
