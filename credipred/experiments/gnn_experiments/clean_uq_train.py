@@ -8,11 +8,14 @@ import random
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 
+from credipred.experiments.gnn_experiments.clean_uq_protocol import (
+    load_role_targets,
+)
 from credipred.utils.checkpoint import snapshot_state_dict
 
 
@@ -96,7 +99,7 @@ def _loader_loss(
     device = next(model.parameters()).device
     total = 0.0
     count = 0
-    context = torch.enable_grad() if training else torch.no_grad()
+    context = torch.enable_grad() if training else torch.no_grad()  # type: ignore[no-untyped-call]
     with context:
         for batch in loader:
             batch = batch.to(device)
@@ -107,7 +110,7 @@ def _loader_loss(
             targets = labels[seed_nodes].to(device)
             loss = _quantile_loss(predictions, targets, alpha)
             if optimizer is not None:
-                loss.backward()
+                loss.backward()  # type: ignore[no-untyped-call]
                 optimizer.step()
             total += float(loss.detach()) * batch.batch_size
             count += batch.batch_size
@@ -186,6 +189,7 @@ def write_role_predictions(
         'node_ids': node_ids,
         'predictions': torch.cat(prediction_parts),
         'labels': labels[node_ids].detach().cpu(),
+        'uq_methods': ['simple', 'cqr'],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
@@ -216,6 +220,7 @@ def write_cached_role_predictions(
         'node_ids': node_ids.detach().cpu(),
         'predictions': parent_predictions[node_ids].detach().cpu(),
         'labels': labels[node_ids].detach().cpu(),
+        'uq_methods': ['simple', 'cqr'],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
@@ -231,13 +236,19 @@ def _load_graph(path: Path) -> Any:
     return loaded
 
 
-def _load_labels(path: Path, num_nodes: int) -> torch.Tensor:
-    labels = torch.load(path, map_location='cpu', weights_only=True)
-    if not isinstance(labels, torch.Tensor) or labels.ndim != 1:
-        raise ValueError('labels.pt must be a one-dimensional tensor')
-    if labels.numel() != num_nodes:
-        raise ValueError('labels.pt length must equal graph node count')
-    return labels.float()
+def _load_labels(
+    path: Path,
+    num_nodes: int,
+    partition_jsonl: Path,
+    expected_roles: tuple[str, ...],
+) -> torch.Tensor:
+    """Load a role-masked artifact and reject any unauthorized finite target."""
+    return load_role_targets(
+        path,
+        partition_jsonl=partition_jsonl,
+        expected_roles=expected_roles,
+        num_nodes=num_nodes,
+    )
 
 
 def _validate_role_labels(labels: torch.Tensor, node_ids: torch.Tensor, role: str) -> None:
@@ -299,12 +310,12 @@ def _prediction_path(run_dir: Path, arm: str, seed: int, role: str) -> Path:
 
 
 def _base_predict(model: torch.nn.Module, batch: Any) -> torch.Tensor:
-    return model(batch.x, batch.edge_index)
+    return cast(torch.Tensor, model(batch.x, batch.edge_index))
 
 
 def _correction_predict(model: torch.nn.Module, batch: Any) -> torch.Tensor:
     base_predictions = batch.base_preds
-    return base_predictions + model(base_predictions, batch.edge_index)
+    return cast(torch.Tensor, base_predictions + model(base_predictions, batch.edge_index))
 
 
 def _build_base_model(config: dict[str, Any], device: torch.device) -> torch.nn.Module:
@@ -383,7 +394,12 @@ def _load_checkpoint(path: Path, *, expected_kind: str) -> dict[str, Any]:
 def _run_base_fit(args: argparse.Namespace) -> dict[str, Any]:
     _set_seed(args.seed)
     data = _load_graph(args.data_pt)
-    labels = _load_labels(args.labels_pt, int(data.num_nodes))
+    labels = _load_labels(
+        args.targets_pt,
+        int(data.num_nodes),
+        args.partition_jsonl,
+        ('fit', 'select'),
+    )
     roles = load_training_roles(args.partition_jsonl)
     _validate_role_labels(labels, roles.fit, 'fit')
     _validate_role_labels(labels, roles.select, 'select')
@@ -495,7 +511,12 @@ def _load_parent_cache(path: Path, seed: int, num_nodes: int) -> torch.Tensor:
 def _run_correction_fit(args: argparse.Namespace) -> dict[str, Any]:
     _set_seed(args.seed)
     data = _load_graph(args.data_pt)
-    labels = _load_labels(args.labels_pt, int(data.num_nodes))
+    labels = _load_labels(
+        args.targets_pt,
+        int(data.num_nodes),
+        args.partition_jsonl,
+        ('fit', 'select'),
+    )
     roles = load_training_roles(args.partition_jsonl)
     _validate_role_labels(labels, roles.fit, 'fit')
     _validate_role_labels(labels, roles.select, 'select')
@@ -547,7 +568,12 @@ def _run_predict_role(args: argparse.Namespace) -> dict[str, Any]:
     rows = _partition_rows(args.partition_jsonl)
     node_ids = _role_node_ids(rows, args.role)
     data = _load_graph(args.data_pt)
-    labels = _load_labels(args.labels_pt, int(data.num_nodes))
+    labels = _load_labels(
+        args.targets_pt,
+        int(data.num_nodes),
+        args.partition_jsonl,
+        (args.role,),
+    )
     _validate_role_labels(labels, node_ids, args.role)
     output_path = args.output_pt or _prediction_path(
         args.run_dir, args.arm, args.seed, args.role
@@ -634,7 +660,7 @@ def _build_parser() -> argparse.ArgumentParser:
     base = stages.add_parser('base-fit')
     _add_common_stage_arguments(base)
     base.add_argument('--data-pt', type=Path, required=True)
-    base.add_argument('--labels-pt', type=Path, required=True)
+    base.add_argument('--targets-pt', type=Path, required=True)
     base.add_argument('--partition-jsonl', type=Path, required=True)
     base.add_argument('--model', choices=SUPPORTED_MODELS, required=True)
     base.add_argument('--epochs', type=int, default=200)
@@ -655,7 +681,7 @@ def _build_parser() -> argparse.ArgumentParser:
     correction = stages.add_parser('correction-fit')
     _add_common_stage_arguments(correction)
     correction.add_argument('--data-pt', type=Path, required=True)
-    correction.add_argument('--labels-pt', type=Path, required=True)
+    correction.add_argument('--targets-pt', type=Path, required=True)
     correction.add_argument('--partition-jsonl', type=Path, required=True)
     correction.add_argument('--parent-cache-pt', type=Path)
     correction.add_argument('--arm', choices=('mlp', 'topology'), required=True)
@@ -670,9 +696,9 @@ def _build_parser() -> argparse.ArgumentParser:
     predict = stages.add_parser('predict-role')
     _add_common_stage_arguments(predict)
     predict.add_argument('--data-pt', type=Path, required=True)
-    predict.add_argument('--labels-pt', type=Path, required=True)
+    predict.add_argument('--targets-pt', type=Path, required=True)
     predict.add_argument('--partition-jsonl', type=Path, required=True)
-    predict.add_argument('--role', choices=('fit', 'select', 'calibrate', 'test'), required=True)
+    predict.add_argument('--role', choices=('calibrate', 'test'), required=True)
     predict.add_argument('--arm', choices=(*SUPPORTED_MODELS, 'GAT-mlp', 'GAT-topology'), required=True)
     predict.add_argument('--checkpoint-pt', type=Path)
     predict.add_argument('--parent-cache-pt', type=Path)

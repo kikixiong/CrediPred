@@ -1,6 +1,7 @@
 """Torch-only tests for clean three-head training and role isolation."""
 
 import inspect
+import hashlib
 import json
 import tempfile
 import unittest
@@ -46,10 +47,10 @@ class CleanUQTrainTest(unittest.TestCase):
         """Catches returning to an implicit runner or historical fixed paths."""
         parser = _build_parser()
         stage_arguments = {
-            'base-fit': ['--data-pt', 'data.pt', '--labels-pt', 'labels.pt', '--partition-jsonl', 'parts.jsonl', '--model', 'FF'],
+            'base-fit': ['--data-pt', 'data.pt', '--targets-pt', 'targets.pt', '--partition-jsonl', 'parts.jsonl', '--model', 'FF'],
             'parent-cache': ['--data-pt', 'data.pt'],
-            'correction-fit': ['--data-pt', 'data.pt', '--labels-pt', 'labels.pt', '--partition-jsonl', 'parts.jsonl', '--arm', 'mlp'],
-            'predict-role': ['--data-pt', 'data.pt', '--labels-pt', 'labels.pt', '--partition-jsonl', 'parts.jsonl', '--role', 'calibrate', '--arm', 'GAT'],
+            'correction-fit': ['--data-pt', 'data.pt', '--targets-pt', 'targets.pt', '--partition-jsonl', 'parts.jsonl', '--arm', 'mlp'],
+            'predict-role': ['--data-pt', 'data.pt', '--targets-pt', 'targets.pt', '--partition-jsonl', 'parts.jsonl', '--role', 'calibrate', '--arm', 'GAT'],
         }
         for stage, extra in stage_arguments.items():
             with self.subTest(stage=stage):
@@ -165,25 +166,33 @@ class CleanUQTrainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_path = root / 'data.pt'
-            labels_path = root / 'labels.pt'
+            targets_path = root / 'targets.pt'
             partitions_path = root / 'partitions.jsonl'
             cache_path = root / 'parent.pt'
             torch.save(SimpleNamespace(num_nodes=5), data_path)
-            labels = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4])
-            torch.save(labels, labels_path)
+            labels = torch.tensor([-1.0, 0.1, -1.0, 0.3, -1.0])
+            partition_rows = [
+                {'node_id': 0, 'mapped': True, 'labelled': True, 'clean_uq_split': 'fit'},
+                {'node_id': 2, 'mapped': True, 'labelled': True, 'clean_uq_split': 'select'},
+                {'node_id': 3, 'mapped': True, 'labelled': True, 'clean_uq_split': 'calibrate'},
+                {'node_id': 1, 'mapped': True, 'labelled': True, 'clean_uq_split': 'calibrate'},
+                {'node_id': 4, 'mapped': True, 'labelled': True, 'clean_uq_split': 'test'},
+            ]
             partitions_path.write_text(
-                ''.join(
-                    json.dumps(
-                        {
-                            'node_id': node_id,
-                            'mapped': True,
-                            'labelled': True,
-                            'clean_uq_split': 'calibrate',
-                        }
-                    )
-                    + '\n'
-                    for node_id in (3, 1)
-                )
+                ''.join(json.dumps(row) + '\n' for row in partition_rows)
+            )
+            partition_hash = hashlib.sha256(partitions_path.read_bytes()).hexdigest()
+            torch.save(
+                {
+                    'schema_version': 'clean-uq-role-targets-v1',
+                    'authorized_roles': ['calibrate'],
+                    'num_nodes': 5,
+                    'partition_sha256': partition_hash,
+                    'source_labels_sha256': '0' * 64,
+                    'sentinel': -1.0,
+                    'labels': labels,
+                },
+                targets_path,
             )
             parent_predictions = torch.arange(15, dtype=torch.float32).reshape(5, 3)
             torch.save(
@@ -201,7 +210,7 @@ class CleanUQTrainTest(unittest.TestCase):
                     partition_jsonl=partitions_path,
                     role='calibrate',
                     data_pt=data_path,
-                    labels_pt=labels_path,
+                    targets_pt=targets_path,
                     run_dir=root / 'run',
                     arm='GAT',
                     seed=42,

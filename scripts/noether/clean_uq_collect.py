@@ -12,9 +12,23 @@ from typing import Any
 
 import torch
 
+from credipred.experiments.gnn_experiments.clean_uq_baselines import (
+    FULL_GRAPH_EDGE_COUNT,
+    FULL_GRAPH_NODE_COUNT,
+    LP_ESTIMAND,
+    LP_GRAPH_PASSES,
+)
+
 
 ARMS = ('FF', 'GCN', 'SAGE', 'GAT', 'GAT-mlp', 'GAT-topology')
 ENSEMBLE_ARM = 'GAT-ensemble'
+BASELINE_ARMS = ('GlobalMedian', 'XGBoost', 'RegressionLP')
+DETERMINISTIC_RUN_ID = 'deterministic'
+BASELINE_METHODS = {
+    'GlobalMedian': ('simple',),
+    'XGBoost': ('simple', 'cqr'),
+    'RegressionLP': ('simple',),
+}
 ROLES = ('fit', 'select', 'calibrate', 'test')
 
 
@@ -120,6 +134,8 @@ def _partition_surface(
 def _prediction_path(run_root: Path, arm: str, seed: int | str, role: str) -> Path:
     if arm == ENSEMBLE_ARM:
         return run_root / 'predictions' / arm / f'{role}.pt'
+    if seed == DETERMINISTIC_RUN_ID:
+        return run_root / 'predictions' / arm / DETERMINISTIC_RUN_ID / f'{role}.pt'
     return run_root / 'predictions' / arm / f'seed-{seed}' / f'{role}.pt'
 
 
@@ -138,6 +154,7 @@ def _load_prediction(
     seed: int | str,
     arm: str,
     expected_nodes: set[int],
+    methods: tuple[str, ...],
     member_seeds: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     payload = torch.load(path, map_location='cpu', weights_only=True)
@@ -150,10 +167,11 @@ def _load_prediction(
     predictions = payload.get('predictions')
     labels = payload.get('labels')
     node_ids = payload.get('node_ids')
+    expected_columns = 3 if methods == ('simple', 'cqr') else 1
     if (
         not isinstance(predictions, torch.Tensor)
         or predictions.ndim != 2
-        or predictions.shape[1] != 3
+        or predictions.shape[1] != expected_columns
         or not isinstance(labels, torch.Tensor)
         or labels.ndim != 1
         or not isinstance(node_ids, torch.Tensor)
@@ -161,7 +179,13 @@ def _load_prediction(
         or predictions.shape[0] != labels.numel()
         or labels.numel() != node_ids.numel()
     ):
-        raise ValueError(f'malformed prediction tensors for {arm}/{seed}/{role}')
+        raise ValueError(
+            f'prediction columns or tensors differ from calibration methods '
+            f'for {arm}/{seed}/{role}'
+        )
+    prediction_methods = payload.get('uq_methods')
+    if prediction_methods is not None and prediction_methods != list(methods):
+        raise ValueError(f'prediction methods mismatch for {arm}/{seed}/{role}')
     if node_ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
         raise ValueError(f'node IDs are not integer-valued for {arm}/{seed}/{role}')
     if not bool(torch.isfinite(predictions).all()) or not bool(torch.isfinite(labels).all()):
@@ -190,7 +214,119 @@ def _load_calibration_state(
         raise ValueError(f'calibration_count mismatch for {arm}/{seed}')
     if member_seeds is not None and state.get('member_seeds') != member_seeds:
         raise ValueError('ensemble calibration members differ from protocol')
+    _state_methods(state, arm=arm, seed=seed)
     return state
+
+
+def _state_methods(
+    state: dict[str, Any], *, arm: str, seed: int | str
+) -> tuple[str, ...]:
+    raw_methods = state.get('methods')
+    if raw_methods not in (['simple'], ['simple', 'cqr']):
+        raise ValueError(f'invalid calibration methods for {arm}/{seed}')
+    expected_kind = (
+        'point-only' if raw_methods == ['simple'] else 'point-with-endpoints'
+    )
+    if state.get('prediction_kind') != expected_kind:
+        raise ValueError(f'prediction kind differs from methods for {arm}/{seed}')
+    return tuple(raw_methods)
+
+
+def _same_path(value: object, expected: Path) -> bool:
+    return isinstance(value, str) and Path(value).resolve() == expected.resolve()
+
+
+def _load_baseline_state(run_root: Path, arm: str) -> dict[str, Any]:
+    path = run_root / 'checkpoints' / arm / f'{DETERMINISTIC_RUN_ID}.json'
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    state = _read_json(path)
+    if (
+        not isinstance(state, dict)
+        or state.get('schema_version') != 'clean-uq-baseline-state-v1'
+        or state.get('seed') != DETERMINISTIC_RUN_ID
+        or state.get('arm') != arm
+    ):
+        raise ValueError(f'baseline state identity mismatch for {arm}')
+    methods = _state_methods(state, arm=arm, seed=DETERMINISTIC_RUN_ID)
+    if methods != BASELINE_METHODS[arm]:
+        raise ValueError(f'baseline methods mismatch for {arm}')
+    if arm == 'GlobalMedian':
+        median = state.get('median')
+        if isinstance(median, bool) or not isinstance(median, (float, int)) or not math.isfinite(median):
+            raise ValueError('GlobalMedian state has an invalid fit median')
+    elif arm == 'XGBoost':
+        midpoint = run_root / 'checkpoints' / arm / 'midpoint.ubj'
+        quantiles = run_root / 'checkpoints' / arm / 'quantiles.ubj'
+        if not _same_path(state.get('midpoint_model'), midpoint) or not _same_path(
+            state.get('quantile_model'), quantiles
+        ):
+            raise ValueError('XGBoost state references foreign selected models')
+        for model in (midpoint, quantiles):
+            if not model.is_file():
+                raise FileNotFoundError(model)
+    else:
+        cache = run_root / 'cache' / arm / f'{DETERMINISTIC_RUN_ID}.pt'
+        if (
+            state.get('full_graph') is not True
+            or state.get('directed') is not True
+            or state.get('num_nodes') != FULL_GRAPH_NODE_COUNT
+            or state.get('num_edges') != FULL_GRAPH_EDGE_COUNT
+            or state.get('estimand') != LP_ESTIMAND
+            or state.get('graph_passes') != LP_GRAPH_PASSES
+            or state.get('deterministic_algorithms') is not True
+            or state.get('execution_device') != 'cpu'
+            or not _same_path(state.get('cache'), cache)
+        ):
+            raise ValueError('RegressionLP state is not bound to the full-graph cache')
+    return state
+
+
+def _validate_lp_support(
+    run_root: Path, *, node_sets: dict[str, set[int]]
+) -> tuple[Path, Path]:
+    probe_path = run_root / 'probe' / 'regression_lp.json'
+    if not probe_path.is_file():
+        raise FileNotFoundError(probe_path)
+    probe = _read_json(probe_path)
+    if (
+        not isinstance(probe, dict)
+        or probe.get('schema_version') != 'clean-uq-lp-probe-v1'
+        or probe.get('full_graph') is not True
+        or probe.get('directed') is not True
+        or probe.get('num_nodes') != FULL_GRAPH_NODE_COUNT
+        or probe.get('num_edges') != FULL_GRAPH_EDGE_COUNT
+        or probe.get('estimand') != LP_ESTIMAND
+        or probe.get('projected_passes') != LP_GRAPH_PASSES
+        or probe.get('execution_device') != 'cpu'
+        or probe.get('deterministic_algorithms') is not True
+        or probe.get('passed') is not True
+    ):
+        raise ValueError('RegressionLP requires a passed full-graph probe receipt')
+    cache_path = run_root / 'cache' / 'RegressionLP' / f'{DETERMINISTIC_RUN_ID}.pt'
+    if not cache_path.is_file():
+        raise FileNotFoundError(cache_path)
+    cache = torch.load(cache_path, map_location='cpu', weights_only=True)
+    predictions = cache.get('predictions') if isinstance(cache, dict) else None
+    reached = cache.get('reached') if isinstance(cache, dict) else None
+    if (
+        not isinstance(cache, dict)
+        or cache.get('schema_version') != 'clean-uq-lp-cache-v1'
+        or cache.get('full_graph') is not True
+        or cache.get('directed') is not True
+        or cache.get('num_nodes') != FULL_GRAPH_NODE_COUNT
+        or cache.get('num_edges') != FULL_GRAPH_EDGE_COUNT
+        or cache.get('estimand') != LP_ESTIMAND
+        or cache.get('fit_seed_count') != len(node_sets['fit'])
+        or not isinstance(predictions, torch.Tensor)
+        or predictions.shape != (FULL_GRAPH_NODE_COUNT,)
+        or not bool(torch.isfinite(predictions).all())
+        or not isinstance(reached, torch.Tensor)
+        or reached.dtype != torch.bool
+        or reached.shape != (FULL_GRAPH_NODE_COUNT,)
+    ):
+        raise ValueError('not a valid RegressionLP full-graph cache')
+    return probe_path, cache_path
 
 
 def _assert_aligned(
@@ -256,39 +392,93 @@ def _validate_pretest(
             if not checkpoint.is_file():
                 raise FileNotFoundError(checkpoint)
             expected_checkpoints.add(checkpoint)
-            prediction_path = _prediction_path(run_root, arm, seed, 'calibrate')
-            current = _load_prediction(
-                prediction_path,
-                role='calibrate', seed=seed, arm=arm,
-                expected_nodes=node_sets['calibrate'],
-            )
-            reference = _assert_aligned(reference, current, role='calibrate')
-            expected_predictions.add(prediction_path)
             state_path = _state_path(run_root, arm, seed)
             state = _load_calibration_state(
                 state_path,
                 seed=seed, arm=arm, expected_count=calibration_count,
             )
+            methods = _state_methods(state, arm=arm, seed=seed)
+            prediction_path = _prediction_path(run_root, arm, seed, 'calibrate')
+            current = _load_prediction(
+                prediction_path,
+                role='calibrate', seed=seed, arm=arm,
+                expected_nodes=node_sets['calibrate'], methods=methods,
+            )
+            reference = _assert_aligned(reference, current, role='calibrate')
+            expected_predictions.add(prediction_path)
             calibration_states[(seed, arm)] = state
             expected_states.add(state_path)
-    ensemble_prediction_path = _prediction_path(
-        run_root, ENSEMBLE_ARM, 'ensemble', 'calibrate'
-    )
-    current = _load_prediction(
-        ensemble_prediction_path,
-        role='calibrate', seed='ensemble', arm=ENSEMBLE_ARM,
-        expected_nodes=node_sets['calibrate'], member_seeds=seeds,
-    )
-    reference = _assert_aligned(reference, current, role='calibrate')
-    expected_predictions.add(ensemble_prediction_path)
     ensemble_state_path = _state_path(run_root, ENSEMBLE_ARM, 'ensemble')
     ensemble_state = _load_calibration_state(
         ensemble_state_path,
         seed='ensemble', arm=ENSEMBLE_ARM, expected_count=calibration_count,
         member_seeds=seeds,
     )
+    ensemble_methods = _state_methods(
+        ensemble_state, arm=ENSEMBLE_ARM, seed='ensemble'
+    )
+    ensemble_prediction_path = _prediction_path(
+        run_root, ENSEMBLE_ARM, 'ensemble', 'calibrate'
+    )
+    current = _load_prediction(
+        ensemble_prediction_path,
+        role='calibrate', seed='ensemble', arm=ENSEMBLE_ARM,
+        expected_nodes=node_sets['calibrate'], methods=ensemble_methods,
+        member_seeds=seeds,
+    )
+    reference = _assert_aligned(reference, current, role='calibrate')
+    expected_predictions.add(ensemble_prediction_path)
     calibration_states[('ensemble', ENSEMBLE_ARM)] = ensemble_state
     expected_states.add(ensemble_state_path)
+
+    expected_baseline_states: set[Path] = set()
+    expected_xgboost_models = {
+        run_root / 'checkpoints' / 'XGBoost' / 'midpoint.ubj',
+        run_root / 'checkpoints' / 'XGBoost' / 'quantiles.ubj',
+    }
+    for arm in BASELINE_ARMS:
+        baseline_state = _load_baseline_state(run_root, arm)
+        if arm == 'GlobalMedian' and baseline_state.get('fit_count') != len(
+            node_sets['fit']
+        ):
+            raise ValueError('GlobalMedian state fit_count differs from the fit role')
+        if arm == 'RegressionLP' and baseline_state.get(
+            'fit_seed_count'
+        ) != len(node_sets['fit']):
+            raise ValueError('RegressionLP seed count differs from the fit role')
+        baseline_state_path = (
+            run_root / 'checkpoints' / arm / f'{DETERMINISTIC_RUN_ID}.json'
+        )
+        expected_baseline_states.add(baseline_state_path)
+        state_path = _state_path(run_root, arm, DETERMINISTIC_RUN_ID)
+        state = _load_calibration_state(
+            state_path,
+            seed=DETERMINISTIC_RUN_ID, arm=arm,
+            expected_count=calibration_count,
+        )
+        methods = _state_methods(
+            state, arm=arm, seed=DETERMINISTIC_RUN_ID
+        )
+        if methods != _state_methods(
+            baseline_state, arm=arm, seed=DETERMINISTIC_RUN_ID
+        ):
+            raise ValueError(f'calibration methods differ from baseline state for {arm}')
+        prediction_path = _prediction_path(
+            run_root, arm, DETERMINISTIC_RUN_ID, 'calibrate'
+        )
+        current = _load_prediction(
+            prediction_path,
+            role='calibrate', seed=DETERMINISTIC_RUN_ID, arm=arm,
+            expected_nodes=node_sets['calibrate'], methods=methods,
+        )
+        reference = _assert_aligned(reference, current, role='calibrate')
+        expected_predictions.add(prediction_path)
+        calibration_states[(DETERMINISTIC_RUN_ID, arm)] = state
+        expected_states.add(state_path)
+
+    lp_probe_path, lp_cache_path = _validate_lp_support(
+        run_root, node_sets=node_sets
+    )
     prediction_count = _check_inventory(
         'calibration prediction', expected_predictions,
         set((run_root / 'predictions').rglob('calibrate.pt')),
@@ -301,30 +491,65 @@ def _validate_pretest(
         'checkpoint', expected_checkpoints,
         set((run_root / 'checkpoints').rglob('seed-*.pt')),
     )
+    baseline_state_count = _check_inventory(
+        'baseline state', expected_baseline_states,
+        set((run_root / 'checkpoints').rglob(f'{DETERMINISTIC_RUN_ID}.json')),
+    )
+    xgboost_model_count = _check_inventory(
+        'XGBoost selected model', expected_xgboost_models,
+        set((run_root / 'checkpoints').rglob('*.ubj')),
+    )
+    all_checkpoint_files = {
+        path for path in (run_root / 'checkpoints').rglob('*') if path.is_file()
+    }
+    _check_inventory(
+        'all checkpoint files',
+        expected_checkpoints | expected_baseline_states | expected_xgboost_models,
+        all_checkpoint_files,
+    )
     cache_count = _check_inventory(
         'parent cache', expected_caches,
         set((run_root / 'cache' / 'GAT').glob('seed-*.pt')),
     )
+    _check_inventory(
+        'all cache files', expected_caches | {lp_cache_path},
+        {path for path in (run_root / 'cache').rglob('*') if path.is_file()},
+    )
+    _check_inventory(
+        'LP probe', {lp_probe_path},
+        {path for path in (run_root / 'probe').rglob('*') if path.is_file()},
+    )
     expected_seed_arms = len(seeds) * len(ARMS)
+    expected_evaluations = expected_seed_arms + 1 + len(BASELINE_ARMS)
     return {
         'schema_version': 'clean-uq-pretest-ledger-v1',
         'phase': 'pretest',
         'model_seeds': seeds,
         'arms': list(ARMS),
         'ensemble_arm': ENSEMBLE_ARM,
+        'baseline_arms': list(BASELINE_ARMS),
+        'baseline_run_id': DETERMINISTIC_RUN_ID,
         'partition_counts': counts,
         'population_funnel': funnel,
         'expected_artifacts': {
-            'calibration_predictions': expected_seed_arms + 1,
-            'calibration_states': expected_seed_arms + 1,
+            'calibration_predictions': expected_evaluations,
+            'calibration_states': expected_evaluations,
             'checkpoints': expected_seed_arms,
+            'baseline_states': len(BASELINE_ARMS),
+            'xgboost_models': len(expected_xgboost_models),
             'parent_caches': len(seeds),
+            'lp_caches': 1,
+            'lp_probes': 1,
         },
         'observed_artifacts': {
             'calibration_predictions': prediction_count,
             'calibration_states': state_count,
             'checkpoints': checkpoint_count,
+            'baseline_states': baseline_state_count,
+            'xgboost_models': xgboost_model_count,
             'parent_caches': cache_count,
+            'lp_caches': 1,
+            'lp_probes': 1,
         },
         'calibration_unique_domain_exposure': len(domain_sets['calibrate']),
         'sealed_test_artifacts_present': False,
@@ -370,9 +595,12 @@ def _load_audit_rows(
     calibration_state: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows = _read_json(path)
-    if not isinstance(rows, list) or len(rows) != 2:
-        raise ValueError(f'test audit must contain two rows for {arm}/{seed}')
-    if {row.get('method') for row in rows if isinstance(row, dict)} != {'simple', 'cqr'}:
+    methods = _state_methods(calibration_state, arm=arm, seed=seed)
+    if not isinstance(rows, list) or len(rows) != len(methods):
+        raise ValueError(
+            f'test audit row count differs from calibration methods for {arm}/{seed}'
+        )
+    if [row.get('method') for row in rows if isinstance(row, dict)] != list(methods):
         raise ValueError(f'test audit methods mismatch for {arm}/{seed}')
     for row in rows:
         if (
@@ -386,9 +614,56 @@ def _load_audit_rows(
             raise ValueError(f'test_count mismatch for {arm}/{seed}')
         if row.get('alpha') != calibration_state.get('alpha'):
             raise ValueError(f'test audit alpha differs from calibration for {arm}/{seed}')
-        for value in row.values():
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError(f'nonfinite test metric for {arm}/{seed}')
+        required_metrics = (
+            'qhat',
+            'coverage',
+            'mean_width',
+            'median_width',
+            'interval_score',
+            'midpoint_mae',
+            'midpoint_rmse',
+        )
+        for metric in required_metrics:
+            value = row.get(metric)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f'missing or nonfinite {metric} for {arm}/{seed}')
+        if not 0.0 <= float(row['coverage']) <= 1.0:
+            raise ValueError(f'coverage outside [0, 1] for {arm}/{seed}')
+        nonnegative = (
+            'qhat',
+            'mean_width',
+            'median_width',
+            'interval_score',
+            'midpoint_mae',
+            'midpoint_rmse',
+        )
+        if any(float(row[metric]) < 0.0 for metric in nonnegative):
+            raise ValueError(f'negative test metric for {arm}/{seed}')
+        if 'midpoint_spearman' not in row or 'raw_crossing_rate' not in row:
+            raise ValueError(f'test audit omits a required nullable metric for {arm}/{seed}')
+        spearman = row['midpoint_spearman']
+        if spearman is not None and (
+            isinstance(spearman, bool)
+            or not isinstance(spearman, (int, float))
+            or not math.isfinite(float(spearman))
+            or not -1.0 <= float(spearman) <= 1.0
+        ):
+            raise ValueError(f'invalid midpoint_spearman for {arm}/{seed}')
+        crossing = row['raw_crossing_rate']
+        if calibration_state.get('prediction_kind') == 'point-only':
+            if crossing is not None:
+                raise ValueError(f'point-only arm reports crossing for {arm}/{seed}')
+        elif (
+            isinstance(crossing, bool)
+            or not isinstance(crossing, (int, float))
+            or not math.isfinite(float(crossing))
+            or not 0.0 <= float(crossing) <= 1.0
+        ):
+            raise ValueError(f'invalid raw_crossing_rate for {arm}/{seed}')
     return rows
 
 
@@ -424,10 +699,13 @@ def collect_sealed_test(
     expected_audits: set[Path] = set()
     for seed in seeds:
         for arm in ARMS:
+            state = states[(seed, arm)]
+            methods = _state_methods(state, arm=arm, seed=seed)
             prediction_path = _prediction_path(run_root, arm, seed, 'test')
             current = _load_prediction(
                 prediction_path,
-                role='test', seed=seed, arm=arm, expected_nodes=node_sets['test'],
+                role='test', seed=seed, arm=arm,
+                expected_nodes=node_sets['test'], methods=methods,
             )
             reference = _assert_aligned(reference, current, role='test')
             expected_predictions.add(prediction_path)
@@ -436,17 +714,22 @@ def collect_sealed_test(
                 _load_audit_rows(
                     audit_path,
                     seed=seed, arm=arm, expected_count=test_count,
-                    calibration_state=states[(seed, arm)],
+                    calibration_state=state,
                 )
             )
             expected_audits.add(audit_path)
     ensemble_prediction_path = _prediction_path(
         run_root, ENSEMBLE_ARM, 'ensemble', 'test'
     )
+    ensemble_state = states[('ensemble', ENSEMBLE_ARM)]
+    ensemble_methods = _state_methods(
+        ensemble_state, arm=ENSEMBLE_ARM, seed='ensemble'
+    )
     current = _load_prediction(
         ensemble_prediction_path,
         role='test', seed='ensemble', arm=ENSEMBLE_ARM,
-        expected_nodes=node_sets['test'], member_seeds=seeds,
+        expected_nodes=node_sets['test'], methods=ensemble_methods,
+        member_seeds=seeds,
     )
     reference = _assert_aligned(reference, current, role='test')
     expected_predictions.add(ensemble_prediction_path)
@@ -455,10 +738,34 @@ def collect_sealed_test(
         _load_audit_rows(
             ensemble_audit_path,
             seed='ensemble', arm=ENSEMBLE_ARM, expected_count=test_count,
-            calibration_state=states[('ensemble', ENSEMBLE_ARM)],
+            calibration_state=ensemble_state,
         )
     )
     expected_audits.add(ensemble_audit_path)
+    for arm in BASELINE_ARMS:
+        state = states[(DETERMINISTIC_RUN_ID, arm)]
+        methods = _state_methods(
+            state, arm=arm, seed=DETERMINISTIC_RUN_ID
+        )
+        prediction_path = _prediction_path(
+            run_root, arm, DETERMINISTIC_RUN_ID, 'test'
+        )
+        current = _load_prediction(
+            prediction_path,
+            role='test', seed=DETERMINISTIC_RUN_ID, arm=arm,
+            expected_nodes=node_sets['test'], methods=methods,
+        )
+        reference = _assert_aligned(reference, current, role='test')
+        expected_predictions.add(prediction_path)
+        audit_path = _audit_path(run_root, arm, DETERMINISTIC_RUN_ID)
+        metric_rows.extend(
+            _load_audit_rows(
+                audit_path,
+                seed=DETERMINISTIC_RUN_ID, arm=arm,
+                expected_count=test_count, calibration_state=state,
+            )
+        )
+        expected_audits.add(audit_path)
     prediction_count = _check_inventory(
         'test prediction', expected_predictions,
         set((run_root / 'predictions').rglob('test.pt')),
@@ -467,8 +774,8 @@ def collect_sealed_test(
         'test audit', expected_audits,
         set((run_root / 'audit').rglob('*_test.json')),
     )
-    expected_artifacts = len(seeds) * len(ARMS) + 1
-    expected_rows = expected_artifacts * 2
+    expected_artifacts = len(seeds) * len(ARMS) + 1 + len(BASELINE_ARMS)
+    expected_rows = sum(len(_state_methods(state, arm=arm, seed=seed)) for (seed, arm), state in states.items())
     if len(metric_rows) != expected_rows:
         raise ValueError('sealed metric row count is incomplete')
     ledger = {
@@ -479,6 +786,8 @@ def collect_sealed_test(
         'model_seeds': seeds,
         'arms': list(ARMS),
         'ensemble_arm': ENSEMBLE_ARM,
+        'baseline_arms': list(BASELINE_ARMS),
+        'baseline_run_id': DETERMINISTIC_RUN_ID,
         'expected': {
             **pretest['expected_artifacts'],
             'test_predictions': expected_artifacts,

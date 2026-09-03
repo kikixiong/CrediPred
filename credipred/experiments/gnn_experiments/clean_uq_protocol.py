@@ -6,10 +6,202 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any, cast
+
+import torch
 
 
 _PARTITIONS = ('fit', 'select', 'calibrate', 'test')
 _TARGET_RATIOS = {'fit': 60, 'select': 10, 'calibrate': 15, 'test': 15}
+_TARGET_SCHEMA = 'clean-uq-role-targets-v1'
+_TARGET_SENTINEL = -1.0
+
+
+def sha256_file(path: Path) -> str:
+    """Hash one frozen input or generated artifact without loading it in memory."""
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _partition_role_nodes(path: Path) -> dict[str, list[int]]:
+    role_nodes: dict[str, list[int]] = {role: [] for role in _PARTITIONS}
+    seen: set[int] = set()
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError('clean-UQ partition rows must be JSON objects')
+        role = row.get('clean_uq_split')
+        if role not in _PARTITIONS:
+            continue
+        node_id = row.get('node_id')
+        if isinstance(node_id, bool) or not isinstance(node_id, int) or node_id < 0:
+            raise ValueError('clean-UQ partition node IDs must be nonnegative integers')
+        if row.get('mapped') is not True or row.get('labelled') is not True:
+            raise ValueError(f'{role} contains an ineligible target row')
+        if node_id in seen:
+            raise ValueError('clean-UQ partition node IDs must be unique')
+        seen.add(node_id)
+        role_nodes[role].append(node_id)
+    if any(not role_nodes[role] for role in _PARTITIONS):
+        raise ValueError('fit/select/calibrate/test target roles must all be nonempty')
+    return role_nodes
+
+
+def _target_payload(
+    full_labels: torch.Tensor,
+    role_nodes: dict[str, list[int]],
+    roles: tuple[str, ...],
+    *,
+    partition_sha256: str,
+    source_labels_sha256: str,
+) -> dict[str, Any]:
+    labels = torch.full_like(full_labels, _TARGET_SENTINEL, dtype=torch.float32)
+    authorized = torch.tensor(
+        sorted(node_id for role in roles for node_id in role_nodes[role]),
+        dtype=torch.long,
+    )
+    labels[authorized] = full_labels[authorized].float()
+    return {
+        'schema_version': _TARGET_SCHEMA,
+        'authorized_roles': list(roles),
+        'num_nodes': int(full_labels.numel()),
+        'partition_sha256': partition_sha256,
+        'source_labels_sha256': source_labels_sha256,
+        'sentinel': _TARGET_SENTINEL,
+        'labels': labels,
+    }
+
+
+def write_role_target_artifacts(
+    source_labels_path: Path,
+    partition_jsonl: Path,
+    pretest_output_dir: Path,
+    sealed_output_dir: Path,
+    *,
+    expected_labels_sha256: str,
+    num_nodes: int,
+) -> dict[str, Path]:
+    """Materialize role-masked pretest targets and a separate sealed-test target."""
+    actual_labels_sha256 = sha256_file(source_labels_path)
+    if actual_labels_sha256 != expected_labels_sha256:
+        raise ValueError('source labels SHA-256 differs from the frozen anchor')
+    full_labels = torch.load(
+        source_labels_path, map_location='cpu', weights_only=True, mmap=True
+    )
+    if not isinstance(full_labels, torch.Tensor) or full_labels.ndim != 1:
+        raise ValueError('source labels must be a one-dimensional tensor')
+    if full_labels.numel() != num_nodes:
+        raise ValueError('source labels length differs from the full graph node count')
+    role_nodes = _partition_role_nodes(partition_jsonl)
+    expected_nodes = torch.tensor(
+        sorted(node_id for nodes in role_nodes.values() for node_id in nodes),
+        dtype=torch.long,
+    )
+    if int(expected_nodes.max()) >= num_nodes:
+        raise ValueError('partition node ID exceeds the full labels tensor')
+    exposed_nodes = torch.nonzero(full_labels >= 0.0).flatten()
+    if not torch.equal(exposed_nodes, expected_nodes):
+        raise ValueError('source labels do not expose exactly the frozen population')
+    population_targets = full_labels[expected_nodes].float()
+    if not bool(torch.isfinite(population_targets).all()) or bool(
+        (population_targets > 1.0).any()
+    ):
+        raise ValueError('frozen targets must be finite values in [0, 1]')
+    unavailable = full_labels < 0.0
+    if not bool((full_labels[unavailable] == _TARGET_SENTINEL).all()):
+        raise ValueError('unavailable source labels must use the -1 sentinel')
+
+    paths = {
+        'fit_select': pretest_output_dir / 'fit_select.pt',
+        'calibrate': pretest_output_dir / 'calibrate.pt',
+        'test': sealed_output_dir / 'test.pt',
+        'ledger': pretest_output_dir / 'clean_uq_target_ledger.json',
+    }
+    if any(path.exists() for path in paths.values()):
+        raise FileExistsError('refusing to overwrite clean-UQ target artifacts')
+    pretest_output_dir.mkdir(parents=True, exist_ok=True)
+    sealed_output_dir.mkdir(parents=True, exist_ok=True)
+    partition_sha256 = sha256_file(partition_jsonl)
+    role_sets = {
+        'fit_select': ('fit', 'select'),
+        'calibrate': ('calibrate',),
+        'test': ('test',),
+    }
+    for name, roles in role_sets.items():
+        torch.save(
+            _target_payload(
+                full_labels,
+                role_nodes,
+                roles,
+                partition_sha256=partition_sha256,
+                source_labels_sha256=actual_labels_sha256,
+            ),
+            paths[name],
+        )
+    ledger = {
+        'schema_version': 'clean-uq-target-ledger-v1',
+        'source_labels_path': str(source_labels_path.resolve()),
+        'source_labels_sha256': actual_labels_sha256,
+        'partition_path': str(partition_jsonl.resolve()),
+        'partition_sha256': partition_sha256,
+        'num_nodes': num_nodes,
+        'artifacts': {
+            name: {
+                'path': str(paths[name].resolve()),
+                'authorized_roles': list(role_sets[name]),
+                'sha256': sha256_file(paths[name]),
+            }
+            for name in role_sets
+        },
+    }
+    paths['ledger'].write_text(
+        json.dumps(ledger, sort_keys=True, separators=(',', ':')) + '\n',
+        encoding='utf-8',
+    )
+    return paths
+
+
+def load_role_targets(
+    path: Path,
+    *,
+    partition_jsonl: Path,
+    expected_roles: tuple[str, ...],
+    num_nodes: int,
+) -> torch.Tensor:
+    """Load exactly the roles authorized for one stage and reject overexposure."""
+    payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+    if not isinstance(payload, dict) or payload.get('schema_version') != _TARGET_SCHEMA:
+        raise ValueError('not a clean-UQ role-target artifact')
+    if payload.get('authorized_roles') != list(expected_roles):
+        raise ValueError('role-target artifact authorizes different roles')
+    if payload.get('num_nodes') != num_nodes or payload.get('sentinel') != _TARGET_SENTINEL:
+        raise ValueError('role-target artifact has incompatible graph metadata')
+    if payload.get('partition_sha256') != sha256_file(partition_jsonl):
+        raise ValueError('role-target artifact belongs to a different partition')
+    labels = payload.get('labels')
+    if not isinstance(labels, torch.Tensor) or labels.ndim != 1:
+        raise ValueError('role-target labels must be a one-dimensional tensor')
+    if labels.numel() != num_nodes:
+        raise ValueError('role-target labels length differs from the full graph')
+    role_nodes = _partition_role_nodes(partition_jsonl)
+    expected_nodes = torch.tensor(
+        sorted(node_id for role in expected_roles for node_id in role_nodes[role]),
+        dtype=torch.long,
+    )
+    exposed_nodes = torch.nonzero(labels != _TARGET_SENTINEL).flatten()
+    if not torch.equal(exposed_nodes, expected_nodes):
+        raise ValueError('role-target artifact exposed unauthorized targets')
+    targets = labels[expected_nodes].float()
+    if not bool(torch.isfinite(targets).all()) or bool(
+        ((targets < 0.0) | (targets > 1.0)).any()
+    ):
+        raise ValueError('authorized role targets must be finite values in [0, 1]')
+    return labels.float()
 
 
 def _canonical_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
@@ -141,10 +333,10 @@ def write_clean_uq_protocol(
     if any(not row['mapped'] or not row['labelled'] for row in sealed_test):
         raise ValueError('sealed test cohort must be mapped and labelled')
     population_domains = {str(row['canonical_domain']) for row in population}
-    population_node_ids = {int(row['node_id']) for row in population}
+    population_node_ids = {cast(int, row['node_id']) for row in population}
     if population_domains & {str(row['canonical_domain']) for row in sealed_test}:
         raise ValueError('sealed test cohort must not reuse a population canonical_domain')
-    if population_node_ids & {int(row['node_id']) for row in sealed_test}:
+    if population_node_ids & {cast(int, row['node_id']) for row in sealed_test}:
         raise ValueError('sealed test cohort must not reuse a population node_id')
     population_groups = {str(row['group_id']) for row in eligible}
     sealed_groups = {str(row['group_id']) for row in sealed_test}

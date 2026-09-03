@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from credipred.conformal_regression.cqr import compute_cqr_scores, compute_qhat
@@ -26,8 +27,12 @@ def _load_predictions(path: Path, expected_role: str) -> dict[str, Any]:
     predictions = payload.get('predictions')
     labels = payload.get('labels')
     node_ids = payload.get('node_ids')
-    if not isinstance(predictions, torch.Tensor) or predictions.ndim != 2 or predictions.shape[1] != 3:
-        raise ValueError('predictions must have shape [N, 3]')
+    if (
+        not isinstance(predictions, torch.Tensor)
+        or predictions.ndim != 2
+        or predictions.shape[1] not in (1, 3)
+    ):
+        raise ValueError('predictions must have shape [N, 1] or [N, 3]')
     if not isinstance(labels, torch.Tensor) or labels.ndim != 1:
         raise ValueError('labels must have shape [N]')
     if not isinstance(node_ids, torch.Tensor) or node_ids.ndim != 1:
@@ -36,6 +41,14 @@ def _load_predictions(path: Path, expected_role: str) -> dict[str, Any]:
         raise ValueError('prediction artifact columns must have equal row counts')
     if labels.numel() == 0:
         raise ValueError(f'{expected_role} prediction artifact is empty')
+    prediction_kind = (
+        'point-only' if predictions.shape[1] == 1 else 'point-with-endpoints'
+    )
+    methods = ['simple'] if predictions.shape[1] == 1 else ['simple', 'cqr']
+    if 'uq_methods' in payload and payload['uq_methods'] != methods:
+        raise ValueError('prediction artifact UQ methods disagree with its columns')
+    payload['_prediction_kind'] = prediction_kind
+    payload['_methods'] = methods
     return payload
 
 
@@ -64,6 +77,8 @@ def write_prediction_ensemble(
     reference = payloads[0]
     if any(payload.get('arm') != 'GAT' for payload in payloads):
         raise ValueError('only GAT seed predictions can form the GAT ensemble')
+    if any(payload['_prediction_kind'] != 'point-with-endpoints' for payload in payloads):
+        raise ValueError('GAT ensemble members require quantile endpoints')
     for payload in payloads[1:]:
         if not torch.equal(payload['node_ids'], reference['node_ids']):
             raise ValueError('ensemble prediction node order differs across seeds')
@@ -80,6 +95,7 @@ def write_prediction_ensemble(
             [payload['predictions'].float() for payload in payloads]
         ).mean(0),
         'member_seeds': [payload.get('seed') for payload in payloads],
+        'uq_methods': ['simple', 'cqr'],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
@@ -96,7 +112,7 @@ def write_calibration_state(
     run_id: str,
     arm: str,
 ) -> dict[str, Any]:
-    """Read calibration-role predictions and persist both conformal quantiles."""
+    """Read calibration predictions and persist every legally supported method."""
     if not 0.0 < alpha < 1.0:
         raise ValueError('alpha must lie strictly between zero and one')
     payload = _load_predictions(predictions_path, 'calibrate')
@@ -106,10 +122,7 @@ def write_calibration_state(
         raise FileExistsError(f'refusing to overwrite calibration state: {state_path}')
     predictions = payload['predictions'].float()
     labels = payload['labels'].float()
-    lower, upper = _ordered_endpoints(predictions)
     simple_scores = torch.abs(predictions[:, 0] - labels)
-    cqr_scores = compute_cqr_scores(lower, upper, labels)
-    raw_cqr_qhat = compute_qhat(cqr_scores, alpha)
     state: dict[str, Any] = {
         'schema_version': 'clean-uq-calibration-v1',
         'seed': payload.get('seed'),
@@ -117,10 +130,20 @@ def write_calibration_state(
         'alpha': alpha,
         'calibration_count': int(labels.numel()),
         'simple_qhat': compute_qhat(simple_scores, alpha),
-        'raw_cqr_qhat': raw_cqr_qhat,
-        'cqr_qhat': max(raw_cqr_qhat, 0.0),
-        'cqr_interval_policy': 'sort_raw_nonnegative_qhat_adjust_clip_0_1',
+        'prediction_kind': payload['_prediction_kind'],
+        'methods': payload['_methods'],
     }
+    if payload['_prediction_kind'] == 'point-with-endpoints':
+        lower, upper = _ordered_endpoints(predictions)
+        cqr_scores = compute_cqr_scores(lower, upper, labels)
+        raw_cqr_qhat = compute_qhat(cqr_scores, alpha)
+        state.update(
+            {
+                'raw_cqr_qhat': raw_cqr_qhat,
+                'cqr_qhat': max(raw_cqr_qhat, 0.0),
+                'cqr_interval_policy': 'sort_raw_nonnegative_qhat_adjust_clip_0_1',
+            }
+        )
     if 'member_seeds' in payload:
         state['member_seeds'] = payload['member_seeds']
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +154,7 @@ def write_calibration_state(
     return state
 
 
-def _average_ranks(values: np.ndarray) -> np.ndarray:
+def _average_ranks(values: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.float64]:
     order = np.argsort(values, kind='mergesort')
     ranks = np.empty(len(values), dtype=float)
     start = 0
@@ -158,7 +181,7 @@ def _metric_row(
     method: str,
     alpha: float,
     qhat: float,
-    raw_crossing_rate: float,
+    raw_crossing_rate: float | None,
     lower: torch.Tensor,
     upper: torch.Tensor,
 ) -> dict[str, Any]:
@@ -211,17 +234,28 @@ def write_test_audit(
         raise ValueError('calibration state and test predictions identify different runs')
     if payload.get('member_seeds') != state_raw.get('member_seeds'):
         raise ValueError('test ensemble members differ from frozen calibration members')
+    state_kind = state_raw.get('prediction_kind')
+    state_methods = state_raw.get('methods')
+    expected_methods = (
+        ['simple'] if state_kind == 'point-only' else ['simple', 'cqr']
+        if state_kind == 'point-with-endpoints'
+        else None
+    )
+    if expected_methods is None or state_methods != expected_methods:
+        raise ValueError('calibration state has an invalid prediction kind or methods')
+    if payload['_prediction_kind'] != state_kind:
+        raise ValueError('test prediction kind differs from frozen calibration')
     alpha = float(state_raw['alpha'])
     predictions = payload['predictions'].float()
-    raw_crossing_rate = float((predictions[:, 1] > predictions[:, 2]).float().mean())
-    ordered_lower, ordered_upper = _ordered_endpoints(predictions)
+    raw_crossing_rate = (
+        float((predictions[:, 1] > predictions[:, 2]).float().mean())
+        if state_kind == 'point-with-endpoints'
+        else None
+    )
 
     simple_qhat = float(state_raw['simple_qhat'])
     simple_lower = torch.clamp(predictions[:, 0] - simple_qhat, 0.0, 1.0)
     simple_upper = torch.clamp(predictions[:, 0] + simple_qhat, 0.0, 1.0)
-    cqr_qhat = float(state_raw['cqr_qhat'])
-    cqr_lower = torch.clamp(ordered_lower - cqr_qhat, 0.0, 1.0)
-    cqr_upper = torch.clamp(ordered_upper + cqr_qhat, 0.0, 1.0)
     rows = [
         _metric_row(
             payload=payload,
@@ -231,17 +265,24 @@ def write_test_audit(
             raw_crossing_rate=raw_crossing_rate,
             lower=simple_lower,
             upper=simple_upper,
-        ),
-        _metric_row(
-            payload=payload,
-            method='cqr',
-            alpha=alpha,
-            qhat=cqr_qhat,
-            raw_crossing_rate=raw_crossing_rate,
-            lower=cqr_lower,
-            upper=cqr_upper,
-        ),
+        )
     ]
+    if state_kind == 'point-with-endpoints':
+        ordered_lower, ordered_upper = _ordered_endpoints(predictions)
+        cqr_qhat = float(state_raw['cqr_qhat'])
+        cqr_lower = torch.clamp(ordered_lower - cqr_qhat, 0.0, 1.0)
+        cqr_upper = torch.clamp(ordered_upper + cqr_qhat, 0.0, 1.0)
+        rows.append(
+            _metric_row(
+                payload=payload,
+                method='cqr',
+                alpha=alpha,
+                qhat=cqr_qhat,
+                raw_crossing_rate=raw_crossing_rate,
+                lower=cqr_lower,
+                upper=cqr_upper,
+            )
+        )
     json_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -284,7 +325,7 @@ def main() -> None:
         output_path = args.output_pt or (
             args.run_dir / 'predictions' / 'GAT-ensemble' / f'{args.role}.pt'
         )
-        result = write_prediction_ensemble(
+        ensemble_result = write_prediction_ensemble(
             args.predictions_pt,
             output_path,
             expected_role=args.role,
@@ -293,7 +334,7 @@ def main() -> None:
             json.dumps(
                 {
                     key: value
-                    for key, value in result.items()
+                    for key, value in ensemble_result.items()
                     if not isinstance(value, torch.Tensor)
                 },
                 sort_keys=True,
@@ -303,7 +344,7 @@ def main() -> None:
 
     state_path = _default_audit_path(args.run_dir, args.seed, args.arm, 'calibration.json')
     if args.stage == 'calibrate':
-        result: Any = write_calibration_state(
+        result: dict[str, Any] | list[dict[str, Any]] = write_calibration_state(
             args.predictions_pt,
             state_path,
             alpha=args.alpha,

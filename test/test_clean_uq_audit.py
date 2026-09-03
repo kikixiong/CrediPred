@@ -384,6 +384,86 @@ class CleanUQAuditTest(unittest.TestCase):
             self.assertIsNone(rows[0]['midpoint_spearman'])
             self.assertIsNone(json.loads(json_path.read_text())[0]['midpoint_spearman'])
 
+    def test_point_only_baseline_calibrates_and_audits_only_simple_conformal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calibration_predictions = root / 'calibrate.pt'
+            test_predictions = root / 'test.pt'
+            state_path = root / 'state.json'
+            _write_predictions(
+                calibration_predictions,
+                role='calibrate',
+                predictions=torch.tensor([[0.2], [0.8]]),
+                labels=torch.tensor([0.1, 0.9]),
+                seed='deterministic',
+                arm='GlobalMedian',
+            )
+            _write_predictions(
+                test_predictions,
+                role='test',
+                predictions=torch.tensor([[0.3], [0.7]]),
+                labels=torch.tensor([0.2, 0.8]),
+                seed='deterministic',
+                arm='GlobalMedian',
+            )
+
+            state = write_calibration_state(
+                calibration_predictions,
+                state_path,
+                alpha=0.1,
+                run_id='deterministic',
+                arm='GlobalMedian',
+            )
+            rows = write_test_audit(
+                test_predictions,
+                state_path,
+                root / 'test.json',
+                root / 'test.csv',
+                run_id='deterministic',
+                arm='GlobalMedian',
+            )
+
+            self.assertEqual(state['prediction_kind'], 'point-only')
+            self.assertEqual(state['methods'], ['simple'])
+            self.assertEqual([row['method'] for row in rows], ['simple'])
+            self.assertIsNone(rows[0]['raw_crossing_rate'])
+
+    def test_test_prediction_kind_must_match_frozen_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calibration_predictions = root / 'calibrate.pt'
+            test_predictions = root / 'test.pt'
+            state_path = root / 'state.json'
+            _write_predictions(
+                calibration_predictions,
+                role='calibrate',
+                predictions=torch.tensor([[0.5]]),
+                labels=torch.tensor([0.5]),
+            )
+            _write_predictions(
+                test_predictions,
+                role='test',
+                predictions=torch.tensor([[0.5, 0.2, 0.8]]),
+                labels=torch.tensor([0.5]),
+            )
+            write_calibration_state(
+                calibration_predictions,
+                state_path,
+                alpha=0.1,
+                run_id='42',
+                arm='GAT',
+            )
+
+            with self.assertRaisesRegex(ValueError, 'prediction kind'):
+                write_test_audit(
+                    test_predictions,
+                    state_path,
+                    root / 'test.json',
+                    root / 'test.csv',
+                    run_id='42',
+                    arm='GAT',
+                )
+
     def test_calibration_rejects_a_test_role_artifact(self) -> None:
         """Catches accidental opening of sealed test labels during calibration."""
         with tempfile.TemporaryDirectory() as temp_dir:

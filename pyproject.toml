@@ -58,6 +58,9 @@ dev = [
 ]
 analytics = [
 ]
+rq1 = [
+    "xgboost-cpu==3.2.0",
+]
 
 [tool.mypy]
 files = ['credipred']
