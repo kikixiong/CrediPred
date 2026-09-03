@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Type, Union
 
 from torch import Tensor, nn
@@ -85,7 +87,7 @@ class FeedForwardModule(nn.Module):
         )
         self.dropout_2 = nn.Dropout(p=dropout)
 
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+    def forward(self, x: Tensor, edge_index: Tensor | None = None) -> Tensor:
         x = self.linear_1(x)
         x = self.dropout_1(x)
         x = self.act(x)
@@ -183,6 +185,6 @@ class FFModule(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+    def forward(self, x: Tensor, edge_index: Tensor | None = None) -> Tensor:
         x = self.feed_forward_module(x)
         return x

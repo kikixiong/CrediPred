@@ -3,6 +3,7 @@ data/
 results/
 saved_graphs/
 spark-warehouse/
+.worktrees/
 #External repos
 external/cc-pyspark/
 external/cc-webgraph/

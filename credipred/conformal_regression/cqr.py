@@ -9,6 +9,8 @@ Provides:
 - Locally adaptive conformal prediction (KNN-based local qhat)
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import Tuple
@@ -27,8 +29,8 @@ def compute_cqr_scores(
 def compute_qhat(scores: torch.Tensor, alpha: float) -> float:
     """Compute conformal quantile from calibration scores."""
     n = scores.numel()
-    q_level = min(max(math.ceil((n + 1) * (1 - alpha)) / n, 1e-6), 1.0)
-    return torch.quantile(scores, q_level, interpolation='higher').item()
+    k = max(1, min(math.ceil((n + 1) * (1 - alpha)), n))
+    return torch.kthvalue(scores.reshape(-1), k).values.item()
 
 
 def adjust_intervals(
