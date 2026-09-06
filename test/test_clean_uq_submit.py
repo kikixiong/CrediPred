@@ -14,6 +14,68 @@ SUBMIT_SCRIPT = REPOSITORY / 'scripts' / 'noether' / 'clean_uq_submit.sh'
 
 
 class CleanUqSubmitTest(unittest.TestCase):
+    def test_sbatch_failure_aborts_without_reporting_a_submitted_dag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / 'source'
+            scripts = source / 'scripts' / 'noether'
+            scripts.mkdir(parents=True)
+            for name in ('clean_uq_stage.sbatch', 'clean_uq_cpu_stage.sbatch'):
+                (scripts / name).touch()
+            python = root / 'python'
+            python.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+            python.chmod(0o755)
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            sbatch = bin_dir / 'sbatch'
+            sbatch.write_text('#!/usr/bin/env bash\nexit 19\n', encoding='utf-8')
+            sbatch.chmod(0o755)
+            data = root / 'data.pt'
+            run_root = root / 'run'
+            target_dir = run_root / 'protocol' / 'targets'
+            target_dir.mkdir(parents=True)
+            representative = run_root / 'checkpoints' / 'GAT' / 'seed-42.pt'
+            representative.parent.mkdir(parents=True)
+            representative.touch()
+            fit_select = target_dir / 'fit_select.pt'
+            calibrate = target_dir / 'calibrate.pt'
+            partitions = root / 'partitions.jsonl'
+            protocol = root / 'protocol.json'
+            target_ledger = root / 'target-ledger.json'
+            for path in (
+                data,
+                fit_select,
+                calibrate,
+                partitions,
+                protocol,
+                target_ledger,
+            ):
+                path.touch()
+
+            completed = subprocess.run(
+                [
+                    'bash', str(SUBMIT_SCRIPT), 'pretest',
+                    '--source-dir', str(source), '--run-root', str(run_root),
+                    '--python-bin', str(python), '--data-pt', str(data),
+                    '--fit-select-targets-pt', str(fit_select),
+                    '--calibrate-targets-pt', str(calibrate),
+                    '--partition-jsonl', str(partitions),
+                    '--protocol-json', str(protocol),
+                    '--target-ledger', str(target_ledger), '--num-nodes', '6',
+                    '--representative-job-id', '12345',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertNotIn('pretest DAG submitted', completed.stdout)
+
     def test_pretest_plan_never_requires_or_mentions_sealed_test_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -43,6 +105,9 @@ class CleanUqSubmitTest(unittest.TestCase):
             run_root = root / 'run'
             target_dir = run_root / 'protocol' / 'targets'
             target_dir.mkdir(parents=True)
+            representative = run_root / 'checkpoints' / 'GAT' / 'seed-42.pt'
+            representative.parent.mkdir(parents=True)
+            representative.touch()
             fit_select = target_dir / 'fit_select.pt'
             calibrate = target_dir / 'calibrate.pt'
             partitions = inputs / 'partitions.jsonl'
@@ -85,6 +150,7 @@ class CleanUqSubmitTest(unittest.TestCase):
             logged = command_log.read_text(encoding='utf-8')
             self.assertNotIn(str(sealed), logged)
             self.assertNotIn('sealed-test-targets-pt', logged)
+            self.assertNotIn('afterok:12345', logged)
             self.assertIn(str(fit_select), logged)
             self.assertIn(str(calibrate), logged)
 

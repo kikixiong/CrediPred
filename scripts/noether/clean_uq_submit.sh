@@ -91,8 +91,11 @@ submit_job() {
     options+=(--dependency="afterok:${dependency}")
   fi
   local submitted
-  submitted=$(sbatch "${options[@]}" "${stage_script}" \
-    "${SOURCE_DIR}" "${RUN_ROOT}" "${PYTHON_BIN}" "$@")
+  if ! submitted=$(sbatch "${options[@]}" "${stage_script}" \
+    "${SOURCE_DIR}" "${RUN_ROOT}" "${PYTHON_BIN}" "$@"); then
+    echo "failed to submit ${name}" >&2
+    return 1
+  fi
   echo "${submitted%%;*}"
 }
 
@@ -228,6 +231,11 @@ fi
 if [[ "${MODE}" == pretest ]]; then
   declare -A BASE_JOB CACHE_JOB CORRECTION_JOB CAL_PRED_JOB
   declare -a CAL_AUDIT_JOBS
+  representative_checkpoint="${RUN_ROOT}/checkpoints/GAT/seed-${FIRST_SEED}.pt"
+  if [[ ! -f "${representative_checkpoint}" ]]; then
+    echo "pretest requires the completed representative checkpoint: ${representative_checkpoint}" >&2
+    exit 64
+  fi
   BASE_JOB["${FIRST_SEED}:GAT"]=${REPRESENTATIVE_JOB_ID}
 
   for seed in "${SEED_VALUES[@]}"; do
@@ -249,8 +257,7 @@ if [[ "${MODE}" == pretest ]]; then
     done
   done
 
-  cache_probe_job=$(submit_gpu "uq-cache-probe-${FIRST_SEED}" \
-    "${BASE_JOB[${FIRST_SEED}:GAT]}" \
+  cache_probe_job=$(submit_gpu "uq-cache-probe-${FIRST_SEED}" "" \
     "${SOURCE_DIR}/scripts/noether/clean_uq_cache_probe.py" \
     --run-dir "${RUN_ROOT}" --seed "${FIRST_SEED}" --data-pt "${DATA_PT}" \
     --sample-nodes "${PROBE_NODES}" --batch-size "${BATCH_SIZE}" \
@@ -277,8 +284,12 @@ if [[ "${MODE}" == pretest ]]; then
     --partition-jsonl "${PARTITION_JSONL}" --chunk-size "${LP_CHUNK_SIZE}")
 
   for seed in "${SEED_VALUES[@]}"; do
-    cache_dependency=$(join_dependencies \
-      "${BASE_JOB["${seed}:GAT"]}" "${cache_probe_job}")
+    if [[ "${seed}" == "${FIRST_SEED}" ]]; then
+      cache_dependency=${cache_probe_job}
+    else
+      cache_dependency=$(join_dependencies \
+        "${BASE_JOB["${seed}:GAT"]}" "${cache_probe_job}")
+    fi
     CACHE_JOB["${seed}"]=$(submit_gpu "uq-cache-${seed}" "${cache_dependency}" \
       -m "${TRAIN_MODULE}" parent-cache \
       --run-dir "${RUN_ROOT}" --seed "${seed}" --data-pt "${DATA_PT}" \
